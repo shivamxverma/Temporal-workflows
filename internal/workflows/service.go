@@ -9,9 +9,12 @@ import (
 )
 
 var (
-	ErrWorkflowAlreadyExists = errors.New("workflow definition with same name and version already exists")
-	ErrWorkflowNotFound      = errors.New("workflow definition not found")
-	ErrTaskAlreadyExists     = errors.New("task definition with same name already exists in workflow definition")
+	ErrWorkflowAlreadyExists       = errors.New("workflow definition with same name and version already exists")
+	ErrWorkflowNotFound            = errors.New("workflow definition not found")
+	ErrTaskAlreadyExists           = errors.New("task definition with same name already exists in workflow definition")
+	ErrWorkflowDefinitionInactive  = errors.New("workflow definition is inactive")
+	ErrWorkflowDefinitionHasNoTasks = errors.New("workflow definition has no task definitions")
+	ErrWorkflowRunNotFound         = errors.New("workflow run not found")
 )
 
 var allowedTaskKinds = []string{"system", "executor", "persistence", "notification"}
@@ -27,8 +30,10 @@ func (e ValidationError) Error() string {
 type Repository interface {
 	CreateWorkflowDefinition(ctx context.Context, params CreateWorkflowDefinitionParams) (WorkflowDefinition, error)
 	CreateTaskDefinition(ctx context.Context, workflowID string, params CreateTaskParams) (TaskDefinition, error)
+	CreateWorkflowRun(ctx context.Context, params CreateWorkflowRunParams) (WorkflowRun, error)
 	ListWorkflowDefinitions(ctx context.Context, includeInactive bool) ([]WorkflowDefinition, error)
 	GetWorkflowDefinition(ctx context.Context, id string) (WorkflowDefinition, error)
+	GetWorkflowRun(ctx context.Context, id string) (WorkflowRun, error)
 }
 
 type Service struct {
@@ -61,6 +66,15 @@ func (s *Service) CreateTaskDefinition(ctx context.Context, workflowID string, r
 	return s.repo.CreateTaskDefinition(ctx, workflowID, params)
 }
 
+func (s *Service) CreateWorkflowRun(ctx context.Context, req CreateWorkflowRunRequest) (WorkflowRun, error) {
+	params, err := validateCreateWorkflowRun(req)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
+
+	return s.repo.CreateWorkflowRun(ctx, params)
+}
+
 func (s *Service) ListWorkflowDefinitions(ctx context.Context, includeInactive bool) ([]WorkflowDefinition, error) {
 	return s.repo.ListWorkflowDefinitions(ctx, includeInactive)
 }
@@ -71,6 +85,14 @@ func (s *Service) GetWorkflowDefinition(ctx context.Context, id string) (Workflo
 	}
 
 	return s.repo.GetWorkflowDefinition(ctx, id)
+}
+
+func (s *Service) GetWorkflowRun(ctx context.Context, id string) (WorkflowRun, error) {
+	if strings.TrimSpace(id) == "" {
+		return WorkflowRun{}, ValidationError{Message: "workflow run id is required"}
+	}
+
+	return s.repo.GetWorkflowRun(ctx, id)
 }
 
 type CreateWorkflowDefinitionParams struct {
@@ -90,6 +112,12 @@ type CreateTaskParams struct {
 	RetryBackoffSeconds int
 	TimeoutSeconds      *int
 	Config              map[string]any
+}
+
+type CreateWorkflowRunParams struct {
+	WorkflowDefinitionID string
+	BusinessID           string
+	InputPayload         map[string]any
 }
 
 func validateCreateWorkflowDefinition(req CreateWorkflowDefinitionRequest) (CreateWorkflowDefinitionParams, error) {
@@ -191,5 +219,23 @@ func validateCreateTaskRequest(task CreateTaskRequest, taskLabel string) (Create
 		RetryBackoffSeconds: retryBackoffSeconds,
 		TimeoutSeconds:      task.TimeoutSeconds,
 		Config:              config,
+	}, nil
+}
+
+func validateCreateWorkflowRun(req CreateWorkflowRunRequest) (CreateWorkflowRunParams, error) {
+	workflowDefinitionID := strings.TrimSpace(req.WorkflowDefinitionID)
+	if workflowDefinitionID == "" {
+		return CreateWorkflowRunParams{}, ValidationError{Message: "workflow_definition_id is required"}
+	}
+
+	inputPayload := req.InputPayload
+	if inputPayload == nil {
+		inputPayload = map[string]any{}
+	}
+
+	return CreateWorkflowRunParams{
+		WorkflowDefinitionID: workflowDefinitionID,
+		BusinessID:           strings.TrimSpace(req.BusinessID),
+		InputPayload:         inputPayload,
 	}, nil
 }
