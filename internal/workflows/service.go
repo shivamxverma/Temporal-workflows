@@ -9,12 +9,12 @@ import (
 )
 
 var (
-	ErrWorkflowAlreadyExists       = errors.New("workflow definition with same name and version already exists")
-	ErrWorkflowNotFound            = errors.New("workflow definition not found")
-	ErrTaskAlreadyExists           = errors.New("task definition with same name already exists in workflow definition")
-	ErrWorkflowDefinitionInactive  = errors.New("workflow definition is inactive")
+	ErrWorkflowAlreadyExists        = errors.New("workflow definition with same name and version already exists")
+	ErrWorkflowNotFound             = errors.New("workflow definition not found")
+	ErrTaskAlreadyExists            = errors.New("task definition with same name already exists in workflow definition")
+	ErrWorkflowDefinitionInactive   = errors.New("workflow definition is inactive")
 	ErrWorkflowDefinitionHasNoTasks = errors.New("workflow definition has no task definitions")
-	ErrWorkflowRunNotFound         = errors.New("workflow run not found")
+	ErrWorkflowRunNotFound          = errors.New("workflow run not found")
 )
 
 var allowedTaskKinds = []string{"system", "executor", "persistence", "notification"}

@@ -36,6 +36,8 @@ func (h *Handler) Server(addr string) *http.Server {
 	v1.POST("/workflow-definitions", h.handleCreateWorkflowDefinition)
 	v1.GET("/workflow-definitions/:id", h.handleGetWorkflowDefinition)
 	v1.POST("/workflow-definitions/:id/task-definitions", h.handleCreateTaskDefinition)
+	v1.POST("/workflow-runs", h.handleCreateWorkflowRun)
+	v1.GET("/workflow-runs/:id", h.handleGetWorkflowRun)
 
 	return &http.Server{
 		Addr:              addr,
@@ -100,6 +102,38 @@ func (h *Handler) handleCreateTaskDefinition(c *gin.Context) {
 	c.JSON(http.StatusCreated, task)
 }
 
+func (h *Handler) handleCreateWorkflowRun(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	var req workflows.CreateWorkflowRunRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+
+	workflowRun, err := h.service.CreateWorkflowRun(ctx, req)
+	if err != nil {
+		h.writeWorkflowError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, workflowRun)
+}
+
+func (h *Handler) handleGetWorkflowRun(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	workflowRun, err := h.service.GetWorkflowRun(ctx, c.Param("id"))
+	if err != nil {
+		h.writeWorkflowError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, workflowRun)
+}
+
 func (h *Handler) writeWorkflowError(c *gin.Context, err error) {
 	var validationErr workflows.ValidationError
 	switch {
@@ -109,8 +143,14 @@ func (h *Handler) writeWorkflowError(c *gin.Context, err error) {
 		writeError(c, http.StatusConflict, "workflow_already_exists", err.Error())
 	case errors.Is(err, workflows.ErrTaskAlreadyExists):
 		writeError(c, http.StatusConflict, "task_already_exists", err.Error())
+	case errors.Is(err, workflows.ErrWorkflowDefinitionInactive):
+		writeError(c, http.StatusConflict, "workflow_definition_inactive", err.Error())
+	case errors.Is(err, workflows.ErrWorkflowDefinitionHasNoTasks):
+		writeError(c, http.StatusConflict, "workflow_definition_has_no_tasks", err.Error())
 	case errors.Is(err, workflows.ErrWorkflowNotFound):
 		writeError(c, http.StatusNotFound, "workflow_not_found", err.Error())
+	case errors.Is(err, workflows.ErrWorkflowRunNotFound):
+		writeError(c, http.StatusNotFound, "workflow_run_not_found", err.Error())
 	default:
 		h.logger.Printf("unexpected error: %v", err)
 		writeError(c, http.StatusInternalServerError, "internal_error", "internal server error")

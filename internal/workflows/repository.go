@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/lib/pq"
 )
@@ -715,7 +716,7 @@ func getNextTaskStepOrder(ctx context.Context, tx *sql.Tx, workflowID string) (i
 	}
 
 	var currentMax int
-	err = tx.QueryRowContext(
+	err := tx.QueryRowContext(
 		ctx,
 		`select coalesce(max(step_order), 0) from task_definitions where workflow_definition_id = $1`,
 		workflowID,
