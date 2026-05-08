@@ -45,6 +45,31 @@ func (r *SQLRepository) CreateWorkflowDefinition(ctx context.Context, params Cre
 	return workflow, nil
 }
 
+func (r *SQLRepository) CreateTaskDefinition(ctx context.Context, workflowID string, params CreateTaskParams) (TaskDefinition, error) {
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return TaskDefinition{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	nextStepOrder, err := getNextTaskStepOrder(ctx, tx, workflowID)
+	if err != nil {
+		return TaskDefinition{}, err
+	}
+
+	params.StepOrder = nextStepOrder
+	tasks, err := insertTaskDefinitions(ctx, tx, workflowID, []CreateTaskParams{params})
+	if err != nil {
+		return TaskDefinition{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return TaskDefinition{}, fmt.Errorf("commit tx: %w", err)
+	}
+
+	return tasks[0], nil
+}
+
 func (r *SQLRepository) ListWorkflowDefinitions(ctx context.Context, includeInactive bool) ([]WorkflowDefinition, error) {
 	query := `
 		select
@@ -258,6 +283,9 @@ func insertTaskDefinitions(ctx context.Context, tx *sql.Tx, workflowID string, t
 			&definition.UpdatedAt,
 		)
 		if err != nil {
+			if isUniqueViolation(err) {
+				return nil, ErrTaskAlreadyExists
+			}
 			return nil, fmt.Errorf("insert task definition %q: %w", task.Name, err)
 		}
 
@@ -270,6 +298,33 @@ func insertTaskDefinitions(ctx context.Context, tx *sql.Tx, workflowID string, t
 	}
 
 	return definitions, nil
+}
+
+func getNextTaskStepOrder(ctx context.Context, tx *sql.Tx, workflowID string) (int, error) {
+	var lockedWorkflowID string
+	err := tx.QueryRowContext(
+		ctx,
+		`select id from workflow_definitions where id = $1 for update`,
+		workflowID,
+	).Scan(&lockedWorkflowID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrWorkflowNotFound
+		}
+		return 0, fmt.Errorf("lock workflow definition: %w", err)
+	}
+
+	var currentMax int
+	err = tx.QueryRowContext(
+		ctx,
+		`select coalesce(max(step_order), 0) from task_definitions where workflow_definition_id = $1`,
+		workflowID,
+	).Scan(&currentMax)
+	if err != nil {
+		return 0, fmt.Errorf("get max task step order: %w", err)
+	}
+
+	return currentMax + 1, nil
 }
 
 func (r *SQLRepository) loadTasks(ctx context.Context, workflowsByID map[string]*WorkflowDefinition) error {

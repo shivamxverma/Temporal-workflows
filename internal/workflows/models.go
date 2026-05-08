@@ -27,6 +27,41 @@ type TaskDefinition struct {
 	UpdatedAt           time.Time      `json:"updated_at"`
 }
 
+type WorkflowRun struct {
+	ID                   string         `json:"id"`
+	WorkflowDefinitionID string         `json:"workflow_definition_id"`
+	BusinessID           string         `json:"business_id,omitempty"`
+	Status               string         `json:"status"`
+	CurrentStepOrder     *int           `json:"current_step_order,omitempty"`
+	InputPayload         map[string]any `json:"input_payload"`
+	OutputPayload        map[string]any `json:"output_payload,omitempty"`
+	ErrorMessage         string         `json:"error_message,omitempty"`
+	StartedAt            *time.Time     `json:"started_at,omitempty"`
+	CompletedAt          *time.Time     `json:"completed_at,omitempty"`
+	CreatedAt            time.Time      `json:"created_at"`
+	UpdatedAt            time.Time      `json:"updated_at"`
+	TaskRuns             []TaskRun      `json:"task_runs"`
+}
+
+type TaskRun struct {
+	ID               string         `json:"id"`
+	WorkflowRunID    string         `json:"workflow_run_id"`
+	TaskDefinitionID string         `json:"task_definition_id"`
+	StepOrder        int            `json:"step_order"`
+	Status           string         `json:"status"`
+	AttemptCount     int            `json:"attempt_count"`
+	InputPayload     map[string]any `json:"input_payload"`
+	OutputPayload    map[string]any `json:"output_payload,omitempty"`
+	ErrorMessage     string         `json:"error_message,omitempty"`
+	ScheduledAt      *time.Time     `json:"scheduled_at,omitempty"`
+	StartedAt        *time.Time     `json:"started_at,omitempty"`
+	CompletedAt      *time.Time     `json:"completed_at,omitempty"`
+	LeaseOwner       string         `json:"lease_owner,omitempty"`
+	LeaseExpiresAt   *time.Time     `json:"lease_expires_at,omitempty"`
+	CreatedAt        time.Time      `json:"created_at"`
+	UpdatedAt        time.Time      `json:"updated_at"`
+}
+
 type CreateWorkflowDefinitionRequest struct {
 	Name        string              `json:"name"`
 	Version     int                 `json:"version"`
@@ -43,4 +78,10 @@ type CreateTaskRequest struct {
 	RetryBackoffSeconds *int           `json:"retry_backoff_seconds"`
 	TimeoutSeconds      *int           `json:"timeout_seconds"`
 	Config              map[string]any `json:"config"`
+}
+
+type CreateWorkflowRunRequest struct {
+	WorkflowDefinitionID string         `json:"workflow_definition_id"`
+	BusinessID           string         `json:"business_id"`
+	InputPayload         map[string]any `json:"input_payload"`
 }

@@ -35,6 +35,7 @@ func (h *Handler) Server(addr string) *http.Server {
 	v1 := router.Group("/api/v1")
 	v1.POST("/workflow-definitions", h.handleCreateWorkflowDefinition)
 	v1.GET("/workflow-definitions/:id", h.handleGetWorkflowDefinition)
+	v1.POST("/workflow-definitions/:id/task-definitions", h.handleCreateTaskDefinition)
 
 	return &http.Server{
 		Addr:              addr,
@@ -80,6 +81,25 @@ func (h *Handler) handleGetWorkflowDefinition(c *gin.Context) {
 	c.JSON(http.StatusOK, workflow)
 }
 
+func (h *Handler) handleCreateTaskDefinition(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	var req workflows.CreateTaskRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
+		return
+	}
+
+	task, err := h.service.CreateTaskDefinition(ctx, c.Param("id"), req)
+	if err != nil {
+		h.writeWorkflowError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, task)
+}
+
 func (h *Handler) writeWorkflowError(c *gin.Context, err error) {
 	var validationErr workflows.ValidationError
 	switch {
@@ -87,6 +107,8 @@ func (h *Handler) writeWorkflowError(c *gin.Context, err error) {
 		writeError(c, http.StatusBadRequest, "validation_error", validationErr.Error())
 	case errors.Is(err, workflows.ErrWorkflowAlreadyExists):
 		writeError(c, http.StatusConflict, "workflow_already_exists", err.Error())
+	case errors.Is(err, workflows.ErrTaskAlreadyExists):
+		writeError(c, http.StatusConflict, "task_already_exists", err.Error())
 	case errors.Is(err, workflows.ErrWorkflowNotFound):
 		writeError(c, http.StatusNotFound, "workflow_not_found", err.Error())
 	default:

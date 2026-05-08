@@ -11,6 +11,7 @@ import (
 var (
 	ErrWorkflowAlreadyExists = errors.New("workflow definition with same name and version already exists")
 	ErrWorkflowNotFound      = errors.New("workflow definition not found")
+	ErrTaskAlreadyExists     = errors.New("task definition with same name already exists in workflow definition")
 )
 
 var allowedTaskKinds = []string{"system", "executor", "persistence", "notification"}
@@ -25,6 +26,7 @@ func (e ValidationError) Error() string {
 
 type Repository interface {
 	CreateWorkflowDefinition(ctx context.Context, params CreateWorkflowDefinitionParams) (WorkflowDefinition, error)
+	CreateTaskDefinition(ctx context.Context, workflowID string, params CreateTaskParams) (TaskDefinition, error)
 	ListWorkflowDefinitions(ctx context.Context, includeInactive bool) ([]WorkflowDefinition, error)
 	GetWorkflowDefinition(ctx context.Context, id string) (WorkflowDefinition, error)
 }
@@ -44,6 +46,19 @@ func (s *Service) CreateWorkflowDefinition(ctx context.Context, req CreateWorkfl
 	}
 
 	return s.repo.CreateWorkflowDefinition(ctx, params)
+}
+
+func (s *Service) CreateTaskDefinition(ctx context.Context, workflowID string, req CreateTaskRequest) (TaskDefinition, error) {
+	if strings.TrimSpace(workflowID) == "" {
+		return TaskDefinition{}, ValidationError{Message: "workflow id is required"}
+	}
+
+	params, err := validateCreateTaskRequest(req, "task")
+	if err != nil {
+		return TaskDefinition{}, err
+	}
+
+	return s.repo.CreateTaskDefinition(ctx, workflowID, params)
 }
 
 func (s *Service) ListWorkflowDefinitions(ctx context.Context, includeInactive bool) ([]WorkflowDefinition, error) {
@@ -103,63 +118,17 @@ func validateCreateWorkflowDefinition(req CreateWorkflowDefinitionRequest) (Crea
 	taskNames := make(map[string]struct{}, len(req.Tasks))
 	tasks := make([]CreateTaskParams, 0, len(req.Tasks))
 	for i, task := range req.Tasks {
-		name := strings.TrimSpace(task.Name)
-		if name == "" {
-			return CreateWorkflowDefinitionParams{}, ValidationError{Message: fmt.Sprintf("task %d: name is required", i+1)}
+		params, err := validateCreateTaskRequest(task, fmt.Sprintf("task %d", i+1))
+		if err != nil {
+			return CreateWorkflowDefinitionParams{}, err
 		}
 
-		if _, exists := taskNames[name]; exists {
-			return CreateWorkflowDefinitionParams{}, ValidationError{Message: fmt.Sprintf("task %q is duplicated", name)}
+		if _, exists := taskNames[params.Name]; exists {
+			return CreateWorkflowDefinitionParams{}, ValidationError{Message: fmt.Sprintf("task %q is duplicated", params.Name)}
 		}
-		taskNames[name] = struct{}{}
-
-		taskKind := strings.TrimSpace(task.TaskKind)
-		if !slices.Contains(allowedTaskKinds, taskKind) {
-			return CreateWorkflowDefinitionParams{}, ValidationError{
-				Message: fmt.Sprintf("task %q: task_kind must be one of %s", name, strings.Join(allowedTaskKinds, ", ")),
-			}
-		}
-
-		handlerName := strings.TrimSpace(task.HandlerName)
-		if handlerName == "" {
-			return CreateWorkflowDefinitionParams{}, ValidationError{Message: fmt.Sprintf("task %q: handler_name is required", name)}
-		}
-
-		retryMaxAttempts := 3
-		if task.RetryMaxAttempts != nil {
-			retryMaxAttempts = *task.RetryMaxAttempts
-		}
-		if retryMaxAttempts < 0 {
-			return CreateWorkflowDefinitionParams{}, ValidationError{Message: fmt.Sprintf("task %q: retry_max_attempts cannot be negative", name)}
-		}
-
-		retryBackoffSeconds := 30
-		if task.RetryBackoffSeconds != nil {
-			retryBackoffSeconds = *task.RetryBackoffSeconds
-		}
-		if retryBackoffSeconds < 0 {
-			return CreateWorkflowDefinitionParams{}, ValidationError{Message: fmt.Sprintf("task %q: retry_backoff_seconds cannot be negative", name)}
-		}
-
-		if task.TimeoutSeconds != nil && *task.TimeoutSeconds <= 0 {
-			return CreateWorkflowDefinitionParams{}, ValidationError{Message: fmt.Sprintf("task %q: timeout_seconds must be greater than 0", name)}
-		}
-
-		config := task.Config
-		if config == nil {
-			config = map[string]any{}
-		}
-
-		tasks = append(tasks, CreateTaskParams{
-			Name:                name,
-			StepOrder:           i + 1,
-			TaskKind:            taskKind,
-			HandlerName:         handlerName,
-			RetryMaxAttempts:    retryMaxAttempts,
-			RetryBackoffSeconds: retryBackoffSeconds,
-			TimeoutSeconds:      task.TimeoutSeconds,
-			Config:              config,
-		})
+		taskNames[params.Name] = struct{}{}
+		params.StepOrder = i + 1
+		tasks = append(tasks, params)
 	}
 
 	return CreateWorkflowDefinitionParams{
@@ -168,5 +137,59 @@ func validateCreateWorkflowDefinition(req CreateWorkflowDefinitionRequest) (Crea
 		Description: strings.TrimSpace(req.Description),
 		IsActive:    isActive,
 		Tasks:       tasks,
+	}, nil
+}
+
+func validateCreateTaskRequest(task CreateTaskRequest, taskLabel string) (CreateTaskParams, error) {
+	name := strings.TrimSpace(task.Name)
+	if name == "" {
+		return CreateTaskParams{}, ValidationError{Message: fmt.Sprintf("%s: name is required", taskLabel)}
+	}
+
+	taskKind := strings.TrimSpace(task.TaskKind)
+	if !slices.Contains(allowedTaskKinds, taskKind) {
+		return CreateTaskParams{}, ValidationError{
+			Message: fmt.Sprintf("task %q: task_kind must be one of %s", name, strings.Join(allowedTaskKinds, ", ")),
+		}
+	}
+
+	handlerName := strings.TrimSpace(task.HandlerName)
+	if handlerName == "" {
+		return CreateTaskParams{}, ValidationError{Message: fmt.Sprintf("task %q: handler_name is required", name)}
+	}
+
+	retryMaxAttempts := 3
+	if task.RetryMaxAttempts != nil {
+		retryMaxAttempts = *task.RetryMaxAttempts
+	}
+	if retryMaxAttempts < 0 {
+		return CreateTaskParams{}, ValidationError{Message: fmt.Sprintf("task %q: retry_max_attempts cannot be negative", name)}
+	}
+
+	retryBackoffSeconds := 30
+	if task.RetryBackoffSeconds != nil {
+		retryBackoffSeconds = *task.RetryBackoffSeconds
+	}
+	if retryBackoffSeconds < 0 {
+		return CreateTaskParams{}, ValidationError{Message: fmt.Sprintf("task %q: retry_backoff_seconds cannot be negative", name)}
+	}
+
+	if task.TimeoutSeconds != nil && *task.TimeoutSeconds <= 0 {
+		return CreateTaskParams{}, ValidationError{Message: fmt.Sprintf("task %q: timeout_seconds must be greater than 0", name)}
+	}
+
+	config := task.Config
+	if config == nil {
+		config = map[string]any{}
+	}
+
+	return CreateTaskParams{
+		Name:                name,
+		TaskKind:            taskKind,
+		HandlerName:         handlerName,
+		RetryMaxAttempts:    retryMaxAttempts,
+		RetryBackoffSeconds: retryBackoffSeconds,
+		TimeoutSeconds:      task.TimeoutSeconds,
+		Config:              config,
 	}, nil
 }

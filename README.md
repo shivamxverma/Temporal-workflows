@@ -46,6 +46,26 @@ Example request:
 
 Returns one workflow definition with its ordered tasks.
 
+### `POST /api/v1/workflow-definitions/{id}/task-definitions`
+
+Creates one task definition for an existing workflow definition. The new task is appended at the next `step_order`.
+
+Example request:
+
+```json
+{
+  "name": "notify_completion",
+  "task_kind": "notification",
+  "handler_name": "notifications.workflow_complete",
+  "retry_max_attempts": 5,
+  "retry_backoff_seconds": 10,
+  "timeout_seconds": 30,
+  "config": {
+    "channel": "email"
+  }
+}
+```
+
 ### `GET /healthz`
 
 Basic health endpoint.
