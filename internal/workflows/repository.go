@@ -70,6 +70,52 @@ func (r *SQLRepository) CreateTaskDefinition(ctx context.Context, workflowID str
 	return tasks[0], nil
 }
 
+func (r *SQLRepository) CreateWorkflowRun(ctx context.Context, params CreateWorkflowRunParams) (WorkflowRun, error) {
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return WorkflowRun{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	workflowDefinition, err := getWorkflowDefinitionForUpdate(ctx, tx, params.WorkflowDefinitionID)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
+	if !workflowDefinition.IsActive {
+		return WorkflowRun{}, ErrWorkflowDefinitionInactive
+	}
+
+	taskDefinitions, err := loadTaskDefinitionsForWorkflow(ctx, tx, workflowDefinition.ID)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
+	if len(taskDefinitions) == 0 {
+		return WorkflowRun{}, ErrWorkflowDefinitionHasNoTasks
+	}
+
+	workflowRun, err := insertWorkflowRun(ctx, tx, params)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
+
+	taskRuns, err := insertTaskRuns(ctx, tx, workflowRun.ID, taskDefinitions)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
+
+	workflowRun.TaskRuns = taskRuns
+
+	if err := insertInitialWorkflowEvents(ctx, tx, workflowRun, taskRuns[0]); err != nil {
+		return WorkflowRun{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return WorkflowRun{}, fmt.Errorf("commit tx: %w", err)
+	}
+
+	return workflowRun, nil
+}
+
 func (r *SQLRepository) ListWorkflowDefinitions(ctx context.Context, includeInactive bool) ([]WorkflowDefinition, error) {
 	query := `
 		select
@@ -174,6 +220,66 @@ func (r *SQLRepository) GetWorkflowDefinition(ctx context.Context, id string) (W
 	}
 
 	return workflow, nil
+}
+
+func (r *SQLRepository) GetWorkflowRun(ctx context.Context, id string) (WorkflowRun, error) {
+	query := `
+		select
+			id,
+			workflow_definition_id,
+			coalesce(business_id, ''),
+			status,
+			current_step_order,
+			input_payload,
+			output_payload,
+			coalesce(error_message, ''),
+			started_at,
+			completed_at,
+			created_at,
+			updated_at
+		from workflow_runs
+		where id = $1
+	`
+
+	var workflowRun WorkflowRun
+	var inputPayloadBytes []byte
+	var outputPayloadBytes []byte
+	err := r.db.QueryRowContext(ctx, query, id).Scan(
+		&workflowRun.ID,
+		&workflowRun.WorkflowDefinitionID,
+		&workflowRun.BusinessID,
+		&workflowRun.Status,
+		&workflowRun.CurrentStepOrder,
+		&inputPayloadBytes,
+		&outputPayloadBytes,
+		&workflowRun.ErrorMessage,
+		&workflowRun.StartedAt,
+		&workflowRun.CompletedAt,
+		&workflowRun.CreatedAt,
+		&workflowRun.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return WorkflowRun{}, ErrWorkflowRunNotFound
+		}
+		return WorkflowRun{}, fmt.Errorf("get workflow run: %w", err)
+	}
+
+	workflowRun.InputPayload, err = decodeConfig(inputPayloadBytes)
+	if err != nil {
+		return WorkflowRun{}, fmt.Errorf("decode workflow run input payload: %w", err)
+	}
+	workflowRun.OutputPayload, err = decodeNullableConfig(outputPayloadBytes)
+	if err != nil {
+		return WorkflowRun{}, fmt.Errorf("decode workflow run output payload: %w", err)
+	}
+
+	workflowRun.TaskRuns, err = r.loadTaskRuns(ctx, workflowRun.ID)
+	if err != nil {
+		return WorkflowRun{}, err
+	}
+
+	return workflowRun, nil
 }
 
 func insertWorkflowDefinition(ctx context.Context, tx *sql.Tx, params CreateWorkflowDefinitionParams) (WorkflowDefinition, error) {
@@ -300,18 +406,312 @@ func insertTaskDefinitions(ctx context.Context, tx *sql.Tx, workflowID string, t
 	return definitions, nil
 }
 
-func getNextTaskStepOrder(ctx context.Context, tx *sql.Tx, workflowID string) (int, error) {
-	var lockedWorkflowID string
-	err := tx.QueryRowContext(
-		ctx,
-		`select id from workflow_definitions where id = $1 for update`,
-		workflowID,
-	).Scan(&lockedWorkflowID)
+func getWorkflowDefinitionForUpdate(ctx context.Context, tx *sql.Tx, workflowID string) (WorkflowDefinition, error) {
+	query := `
+		select
+			id,
+			name,
+			version,
+			coalesce(description, ''),
+			is_active,
+			created_at,
+			updated_at
+		from workflow_definitions
+		where id = $1
+		for update
+	`
+
+	var workflowDefinition WorkflowDefinition
+	err := tx.QueryRowContext(ctx, query, workflowID).Scan(
+		&workflowDefinition.ID,
+		&workflowDefinition.Name,
+		&workflowDefinition.Version,
+		&workflowDefinition.Description,
+		&workflowDefinition.IsActive,
+		&workflowDefinition.CreatedAt,
+		&workflowDefinition.UpdatedAt,
+	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return 0, ErrWorkflowNotFound
+			return WorkflowDefinition{}, ErrWorkflowNotFound
 		}
-		return 0, fmt.Errorf("lock workflow definition: %w", err)
+		return WorkflowDefinition{}, fmt.Errorf("lock workflow definition: %w", err)
+	}
+
+	return workflowDefinition, nil
+}
+
+func loadTaskDefinitionsForWorkflow(ctx context.Context, tx *sql.Tx, workflowID string) ([]TaskDefinition, error) {
+	query := `
+		select
+			id,
+			name,
+			step_order,
+			task_kind,
+			handler_name,
+			retry_max_attempts,
+			retry_backoff_seconds,
+			timeout_seconds,
+			config,
+			created_at,
+			updated_at
+		from task_definitions
+		where workflow_definition_id = $1
+		order by step_order asc
+	`
+
+	rows, err := tx.QueryContext(ctx, query, workflowID)
+	if err != nil {
+		return nil, fmt.Errorf("query task definitions for workflow: %w", err)
+	}
+	defer rows.Close()
+
+	taskDefinitions := make([]TaskDefinition, 0)
+	for rows.Next() {
+		var taskDefinition TaskDefinition
+		var configBytes []byte
+		if err := rows.Scan(
+			&taskDefinition.ID,
+			&taskDefinition.Name,
+			&taskDefinition.StepOrder,
+			&taskDefinition.TaskKind,
+			&taskDefinition.HandlerName,
+			&taskDefinition.RetryMaxAttempts,
+			&taskDefinition.RetryBackoffSeconds,
+			&taskDefinition.TimeoutSeconds,
+			&configBytes,
+			&taskDefinition.CreatedAt,
+			&taskDefinition.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan task definition for workflow: %w", err)
+		}
+
+		taskDefinition.Config, err = decodeConfig(configBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode task definition config: %w", err)
+		}
+
+		taskDefinitions = append(taskDefinitions, taskDefinition)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate task definitions for workflow: %w", err)
+	}
+
+	return taskDefinitions, nil
+}
+
+func insertWorkflowRun(ctx context.Context, tx *sql.Tx, params CreateWorkflowRunParams) (WorkflowRun, error) {
+	query := `
+		insert into workflow_runs (
+			workflow_definition_id,
+			business_id,
+			status,
+			current_step_order,
+			input_payload,
+			started_at
+		) values ($1, $2, $3, $4, $5, now())
+		returning
+			id,
+			workflow_definition_id,
+			coalesce(business_id, ''),
+			status,
+			current_step_order,
+			input_payload,
+			output_payload,
+			coalesce(error_message, ''),
+			started_at,
+			completed_at,
+			created_at,
+			updated_at
+	`
+
+	rawInputPayload, err := json.Marshal(params.InputPayload)
+	if err != nil {
+		return WorkflowRun{}, fmt.Errorf("marshal workflow run input payload: %w", err)
+	}
+
+	var workflowRun WorkflowRun
+	var inputPayloadBytes []byte
+	var outputPayloadBytes []byte
+	err = tx.QueryRowContext(
+		ctx,
+		query,
+		params.WorkflowDefinitionID,
+		nullIfEmpty(params.BusinessID),
+		"running",
+		1,
+		rawInputPayload,
+	).Scan(
+		&workflowRun.ID,
+		&workflowRun.WorkflowDefinitionID,
+		&workflowRun.BusinessID,
+		&workflowRun.Status,
+		&workflowRun.CurrentStepOrder,
+		&inputPayloadBytes,
+		&outputPayloadBytes,
+		&workflowRun.ErrorMessage,
+		&workflowRun.StartedAt,
+		&workflowRun.CompletedAt,
+		&workflowRun.CreatedAt,
+		&workflowRun.UpdatedAt,
+	)
+	if err != nil {
+		return WorkflowRun{}, fmt.Errorf("insert workflow run: %w", err)
+	}
+
+	workflowRun.InputPayload, err = decodeConfig(inputPayloadBytes)
+	if err != nil {
+		return WorkflowRun{}, fmt.Errorf("decode workflow run input payload: %w", err)
+	}
+	workflowRun.OutputPayload, err = decodeNullableConfig(outputPayloadBytes)
+	if err != nil {
+		return WorkflowRun{}, fmt.Errorf("decode workflow run output payload: %w", err)
+	}
+	workflowRun.TaskRuns = []TaskRun{}
+
+	return workflowRun, nil
+}
+
+func insertTaskRuns(ctx context.Context, tx *sql.Tx, workflowRunID string, taskDefinitions []TaskDefinition) ([]TaskRun, error) {
+	query := `
+		insert into task_runs (
+			workflow_run_id,
+			task_definition_id,
+			step_order,
+			status,
+			attempt_count,
+			input_payload,
+			scheduled_at
+		) values ($1, $2, $3, $4, $5, $6, $7)
+		returning
+			id,
+			workflow_run_id,
+			task_definition_id,
+			step_order,
+			status,
+			attempt_count,
+			input_payload,
+			output_payload,
+			coalesce(error_message, ''),
+			scheduled_at,
+			started_at,
+			completed_at,
+			coalesce(lease_owner, ''),
+			lease_expires_at,
+			created_at,
+			updated_at
+	`
+
+	taskRuns := make([]TaskRun, 0, len(taskDefinitions))
+	emptyPayload := []byte(`{}`)
+
+	for i, taskDefinition := range taskDefinitions {
+		status := "pending"
+		var scheduledAt any
+		if i == 0 {
+			status = "scheduled"
+			scheduledAt = time.Now().UTC()
+		}
+
+		var taskRun TaskRun
+		var inputPayloadBytes []byte
+		var outputPayloadBytes []byte
+		err := tx.QueryRowContext(
+			ctx,
+			query,
+			workflowRunID,
+			taskDefinition.ID,
+			taskDefinition.StepOrder,
+			status,
+			0,
+			emptyPayload,
+			scheduledAt,
+		).Scan(
+			&taskRun.ID,
+			&taskRun.WorkflowRunID,
+			&taskRun.TaskDefinitionID,
+			&taskRun.StepOrder,
+			&taskRun.Status,
+			&taskRun.AttemptCount,
+			&inputPayloadBytes,
+			&outputPayloadBytes,
+			&taskRun.ErrorMessage,
+			&taskRun.ScheduledAt,
+			&taskRun.StartedAt,
+			&taskRun.CompletedAt,
+			&taskRun.LeaseOwner,
+			&taskRun.LeaseExpiresAt,
+			&taskRun.CreatedAt,
+			&taskRun.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("insert task run for step %d: %w", taskDefinition.StepOrder, err)
+		}
+
+		taskRun.InputPayload, err = decodeConfig(inputPayloadBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode task run input payload for step %d: %w", taskDefinition.StepOrder, err)
+		}
+		taskRun.OutputPayload, err = decodeNullableConfig(outputPayloadBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode task run output payload for step %d: %w", taskDefinition.StepOrder, err)
+		}
+
+		taskRuns = append(taskRuns, taskRun)
+	}
+
+	return taskRuns, nil
+}
+
+func insertInitialWorkflowEvents(ctx context.Context, tx *sql.Tx, workflowRun WorkflowRun, firstTaskRun TaskRun) error {
+	workflowStartedPayload := map[string]any{
+		"workflow_definition_id": workflowRun.WorkflowDefinitionID,
+		"status":                 workflowRun.Status,
+		"current_step_order":     workflowRun.CurrentStepOrder,
+	}
+	if err := insertWorkflowEvent(ctx, tx, workflowRun.ID, nil, 1, "workflow_started", workflowStartedPayload); err != nil {
+		return err
+	}
+
+	taskScheduledPayload := map[string]any{
+		"task_definition_id": firstTaskRun.TaskDefinitionID,
+		"step_order":         firstTaskRun.StepOrder,
+		"status":             firstTaskRun.Status,
+	}
+	if err := insertWorkflowEvent(ctx, tx, workflowRun.ID, &firstTaskRun.ID, 2, "task_scheduled", taskScheduledPayload); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func insertWorkflowEvent(ctx context.Context, tx *sql.Tx, workflowRunID string, taskRunID *string, sequenceNumber int64, eventType string, payload map[string]any) error {
+	query := `
+		insert into workflow_events (
+			workflow_run_id,
+			task_run_id,
+			sequence_number,
+			event_type,
+			payload
+		) values ($1, $2, $3, $4, $5)
+	`
+
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal workflow event payload: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, query, workflowRunID, taskRunID, sequenceNumber, eventType, rawPayload); err != nil {
+		return fmt.Errorf("insert workflow event %q: %w", eventType, err)
+	}
+
+	return nil
+}
+
+func getNextTaskStepOrder(ctx context.Context, tx *sql.Tx, workflowID string) (int, error) {
+	if _, err := getWorkflowDefinitionForUpdate(ctx, tx, workflowID); err != nil {
+		return 0, err
 	}
 
 	var currentMax int
@@ -413,9 +813,97 @@ func decodeConfig(data []byte) (map[string]any, error) {
 	return config, nil
 }
 
+func decodeNullableConfig(data []byte) (map[string]any, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	var config map[string]any
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, err
+	}
+
+	return config, nil
+}
+
 func isUniqueViolation(err error) bool {
 	var pqErr *pq.Error
 	return errors.As(err, &pqErr) && pqErr.Code == "23505"
+}
+
+func (r *SQLRepository) loadTaskRuns(ctx context.Context, workflowRunID string) ([]TaskRun, error) {
+	query := `
+		select
+			id,
+			workflow_run_id,
+			task_definition_id,
+			step_order,
+			status,
+			attempt_count,
+			input_payload,
+			output_payload,
+			coalesce(error_message, ''),
+			scheduled_at,
+			started_at,
+			completed_at,
+			coalesce(lease_owner, ''),
+			lease_expires_at,
+			created_at,
+			updated_at
+		from task_runs
+		where workflow_run_id = $1
+		order by step_order asc
+	`
+
+	rows, err := r.db.QueryContext(ctx, query, workflowRunID)
+	if err != nil {
+		return nil, fmt.Errorf("query task runs: %w", err)
+	}
+	defer rows.Close()
+
+	taskRuns := make([]TaskRun, 0)
+	for rows.Next() {
+		var taskRun TaskRun
+		var inputPayloadBytes []byte
+		var outputPayloadBytes []byte
+		if err := rows.Scan(
+			&taskRun.ID,
+			&taskRun.WorkflowRunID,
+			&taskRun.TaskDefinitionID,
+			&taskRun.StepOrder,
+			&taskRun.Status,
+			&taskRun.AttemptCount,
+			&inputPayloadBytes,
+			&outputPayloadBytes,
+			&taskRun.ErrorMessage,
+			&taskRun.ScheduledAt,
+			&taskRun.StartedAt,
+			&taskRun.CompletedAt,
+			&taskRun.LeaseOwner,
+			&taskRun.LeaseExpiresAt,
+			&taskRun.CreatedAt,
+			&taskRun.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan task run: %w", err)
+		}
+
+		taskRun.InputPayload, err = decodeConfig(inputPayloadBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode task run input payload: %w", err)
+		}
+		taskRun.OutputPayload, err = decodeNullableConfig(outputPayloadBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode task run output payload: %w", err)
+		}
+
+		taskRuns = append(taskRuns, taskRun)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate task runs: %w", err)
+	}
+
+	return taskRuns, nil
 }
 
 func nullIfEmpty(value string) any {
